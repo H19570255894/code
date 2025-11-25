@@ -1,0 +1,11 @@
+torch>=2.0.0
+torch-geometric>=2.3.0
+numpy
+scipy
+networkx
+gensim
+tqdm
+pyyaml
+matplotlib
+seaborn
+node2vec==0.4.3
