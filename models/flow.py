@@ -1,463 +1,318 @@
 # models/flow.py
 import math
-from typing import Dict, Tuple
+import random
+from typing import Optional, Dict, Tuple
 
+import numpy as np
 import torch
-from torch import nn
+from torch import nn, Tensor
 
-# ===================== 基础洛伦兹几何工具 =====================
-
-def minkowski_inner(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    洛伦兹模型下的 Minkowski 内积：
-        <x, y>_L = -x0*y0 + x1*y1 + ... + xd*yd
-    x, y: (..., D)
-    返回: (...,)
-    """
-    # 保证最后一维是坐标
-    prod = x * y
-    # -x0*y0
-    inner_time = -prod[..., 0]
-    # 空间部分求和
-    inner_space = prod[..., 1:].sum(dim=-1)
-    return inner_time + inner_space
+from .hyperbolic_ops import (
+    log_map,
+    exp_map,
+    hyperbolic_distance,
+    project_to_manifold,
+    project_to_tangent,
+    lorentz_norm_sq,
+)
 
 
-def project_to_tangent(z: torch.Tensor, v: torch.Tensor, K: float) -> torch.Tensor:
-    """
-    将任意向量 v 投影到 H_{d,K} 在 z 处的切空间 T_z H_{d,K}。
-    公式来自论文式 (22) + 下面文字中的显式投影：
-        Π_z(v) = v - <v,z>_L / <z,z>_L * z
-    这里 <z,z>_L = -K.
-    """
-    # <v, z>_L
-    vz = minkowski_inner(v, z)
-    # <z, z>_L = -K
-    denom = -K
-    coef = (vz / denom).unsqueeze(-1)  # (...,1)
-    return v - coef * z
-
-
-def lorentz_norm_sq(v: torch.Tensor) -> torch.Tensor:
-    """
-    切向量在洛伦兹度量下的“范数平方”：
-        ||v||_g^2 = <v, v>_L , 对于切向量应为正数。
-    为了数值稳定我们做上下界截断。
-    """
-    val = minkowski_inner(v, v)
-    # 下界防止 sqrt 负数，上界防止后面 cosh/sinh 爆掉
-    val = torch.clamp(val, min=1e-12, max=1e3)
-    return val
-
-
-
-def exp_map(z: torch.Tensor, v: torch.Tensor, K: float) -> torch.Tensor:
-    """
-    指数映射 Exp_K(z, v)，对应论文式 (19) 中的 Exp_K。
-    为了数值稳定：
-      - 对 ||v||_g 做上界截断
-      - 对 d/sqrt(K) 做上界截断，避免 cosh/sinh 溢出
-      - 结果再重新投影到超曲面 H_{d,K} 上
-    """
-    v = project_to_tangent(z, v, K)
-    d_sq = lorentz_norm_sq(v)                # 已经带上下界
-    d = torch.sqrt(d_sq)                    # (...,)
-
-    sqrtK = math.sqrt(K)
-    d_over_sqrtK = d / sqrtK
-    # 避免 cosh/sinh(特别大) → Inf
-    d_over_sqrtK = torch.clamp(d_over_sqrtK, min=0.0, max=10.0)
-
-    coef_z = torch.cosh(d_over_sqrtK)       # (...,)
-    # 避免 0 除
-    coef_v = torch.zeros_like(coef_z)
-    nonzero = d_over_sqrtK > 1e-6
-    coef_v[nonzero] = (
-        sqrtK * torch.sinh(d_over_sqrtK[nonzero]) / d_over_sqrtK[nonzero]
-    )
-    coef_v[~nonzero] = sqrtK  # 极限 d→0 时 sinh(d)/d → 1
-
-    coef_z = coef_z.unsqueeze(-1)           # (...,1)
-    coef_v = coef_v.unsqueeze(-1)           # (...,1)
-
-    y = coef_z * z + coef_v * v            # (..., D)
-
-    # 数值误差会破坏 <y,y>_L = -K，重新投影回超曲面
-    # 令 y0 = sqrt( ||y_spatial||^2 + K )
-    spatial_sq = (y[..., 1:] ** 2).sum(dim=-1)
-    y0 = torch.sqrt(torch.clamp(spatial_sq + K, min=K))
-    y = y.clone()
-    y[..., 0] = y0
-    return y
-
-
-
-def log_map(z0: torch.Tensor, z1: torch.Tensor, K: float) -> torch.Tensor:
-    """
-    对数映射 Log_K(z0, z1)，对应论文式 (19) 中的 Log_K。
-    加入数值稳定：
-      - cosh_arg = -<z0,z1>/K 在 [1, 1e6] 内截断
-      - alpha = arcosh(cosh_arg) 在 [1e-6, 10] 内截断
-    """
-    # cosh(d_K / sqrt(K)) = -<z0,z1>_L / K
-    cosh_arg = -minkowski_inner(z0, z1) / K
-    cosh_arg = torch.clamp(cosh_arg, min=1.0 + 1e-6, max=1e6)
-    alpha = torch.acosh(cosh_arg)                  # (...,)
-
-    # 投影到切空间（未做归一）
-    inner_z0z1 = minkowski_inner(z0, z1)           # (...,)
-    coef = (inner_z0z1 / K).unsqueeze(-1)
-    u = z1 + coef * z0                             # (..., D)
-
-    # 避免 alpha 和 sinh(alpha) 爆掉或为 0
-    alpha_clamped = torch.clamp(alpha, min=1e-6, max=10.0)
-    scale = (alpha_clamped / torch.sinh(alpha_clamped)).unsqueeze(-1)
-
-    v = scale * u
-    # 理论上已经在 T_{z0}，再投影一次防数值误差
-    v = project_to_tangent(z0, v, K)
-    return v
-
-
-
-
-def parallel_transport(z0: torch.Tensor,
-                       zt: torch.Tensor,
-                       v: torch.Tensor,
-                       K: float) -> torch.Tensor:
-    """
-    沿测地线 γ_{z0,z1} 在 z0 -> zt 上的平行移动，论文式 (21)：
-        PT(·) = · + <z_t, ·>_L / (K - <z_0, z_t>_L) * (z_0 + z_t)
-    这里的 “·” 即 v.
-    """
-    num = minkowski_inner(zt, v)                    # (...,)
-    denom = K - minkowski_inner(z0, zt)             # (...,)
-    denom = torch.clamp(denom, min=1e-6)
-    coef = (num / denom).unsqueeze(-1)              # (...,1)
-    return v + coef * (z0 + zt)
-
-
-# ===================== 向量场网络 f_theta =====================
+# =======================================
+#  Hyperbolic Vector Field v_theta(z, t)
+# =======================================
 
 class HyperbolicVectorField(nn.Module):
     """
-    时间依赖的双曲向量场 f_θ(z, t) ∈ T_z H_{d,K}，对应论文式 (18)。
+    双曲流匹配中的向量场 v_theta(z, t)，定义在 Lorentz 模型的切空间上。
 
-    - 输入:
-        z: (N, D)  位于 H_{d,K} 的点
-        t: 标量或 (N,) / (N,1) , t ∈ [0,1]
-    - 输出:
-        v: (N, D)  已经投影到切空间的向量
+    结构：
+      - 输入: z ∈ H_{d,K} (Lorentz 坐标，维度 D = d+1)
+      - 时间: t ∈ [0,1] 标量，经 time-MLP 编码成高维
+      - 输出: T_z H_{d,K} 中的切向量，最终通过 project_to_tangent 保证切空间约束。
     """
 
     def __init__(
         self,
-        dim: int,
+        dim: int,             # 这里的 dim 是“空间维 d”，实际输入 z 维度是 d+1
         hidden_dim: int = 256,
-        num_layers: int = 3,
+        time_embed_dim: int = 64,
         K: float = 1.0,
     ):
-        """
-        dim: 论文里的 d，对应空间维度；实际输入维度是 D = d+1。
-             在 train_flow_small 中，我们传的是 D-1。
-        """
         super().__init__()
         self.dim = dim
-        self.D = dim + 1
+        self.D = dim + 1      # Lorentz 坐标维度
         self.K = K
 
-        in_dim = self.D + 1  # 拼接一个时间标量 t
+        # 时间编码 φ(t)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+        )
 
-        layers = []
-        last = in_dim
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(last, hidden_dim))
-            layers.append(nn.SiLU())
-            last = hidden_dim
-        layers.append(nn.Linear(last, self.D))
-        self.net = nn.Sequential(*layers)
+        # 主干 MLP: [z(=D) || φ(t)] -> D（一个 Lorentz 向量）
+        in_dim = self.D + time_embed_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.D),
+        )
 
-    def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: Tensor, t: Tensor) -> Tensor:
         """
-        z: (N, D)
-        t: 标量、(N,) 或 (N,1)
+        z: (N, D)  双曲面上的点（Lorentz 坐标）
+        t: 标量 or (N,) or (N,1)，在 [0,1] 内
+        返回: (N, D)  T_z H 上的切向量
         """
         if t.dim() == 0:
-            t = t.expand(z.size(0))
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)  # (N,1)
+            t = t.expand(z.size(0), 1)
+        elif t.dim() == 1:
+            t = t.unsqueeze(-1)
 
-        inp = torch.cat([z, t], dim=-1)      # (N, D+1)
-        v_raw = self.net(inp)                # (N, D)
+        t_embed = self.time_mlp(t)        # (N, time_embed_dim)
+        h = torch.cat([z, t_embed], dim=-1)
+        v = self.net(h)                   # (N, D)
 
-        # 投到切空间，保证 <v,z>_L = 0，对应式 (22)
-        v_tan = project_to_tangent(z, v_raw, self.K)
-        return v_tan
+        # 投影到切空间，保证 <z,v>_L = 0
+        v = project_to_tangent(z, v, self.K)
+        return v
 
 
-# ===================== Flow Matching 训练器 =====================
+# =======================================
+#  Flow Matching + Graph Regularization
+# =======================================
 
 class HyperbolicFlowTrainer:
     """
-    实现论文 3.3 的训练目标：
+    对应论文中的 Hyperbolic Flow Matching + 图正则。
 
-      - Flow Matching 主损失  L_FM  （式 (23)）
-      - Graph-structured regularization L_graph （式 (24)-(27)）
+    - Flow Matching:
+        在 geodesic 上采样中间点 z_t，并用
+            u_t = log_{z_t}(z1) / (1 - t)
+        做目标向量场（条件流匹配的几何版）。
 
-    当前实现思路：
-      * L_FM: 和之前一样，用 geodesic 插值 + 平行移动监督速度
-      * L_graph: 对于每个目标节点 v，取其图邻居 N(v)，
-        在 z0 处对邻居做 log-map 并求均值，得到 v_agg，
-        然后和 L_FM 同样的方式做 geodesic 插值 + 平行移动，
-        强制 f_theta(z_t, t) 贴近这个“邻居聚合方向”。
-
-    为了数值稳定，所有中间量都做 nan_to_num + clamp。
+    - Graph Regularization:
+        在图的边 (i,j) 上约束
+            || v_theta(z_i, t) - v_theta(z_j, t) ||_L^2
+        保持向量场在图结构上的平滑性。
     """
 
     def __init__(
         self,
-        vector_field: HyperbolicVectorField,
+        vf: HyperbolicVectorField,
         K: float = 1.0,
         lambda_graph: float = 0.0,
         graph=None,
-        all_embeddings: torch.Tensor | None = None,
+        all_embeddings: Optional[Tensor] = None,
+        num_graph_samples: int = 256,
     ):
-        """
-        vector_field: HyperbolicVectorField 实例
-        K:           曲率参数
-        lambda_graph: 图正则权重 λ_graph
-        graph:       networkx.Graph, 节点索引用于 all_embeddings 的行号
-        all_embeddings: (N, D) 的全体节点超曲嵌入张量，用于邻居聚合
-        """
-        self.vf = vector_field
+        super().__init__()
+        self.vf = vf
         self.K = K
         self.lambda_graph = lambda_graph
-        self.g = graph
-        self.z_all = all_embeddings  # 期望已经在正确的 device 上
+        self.graph = graph
+        self.all_embeddings = all_embeddings  # (N, D)
+        self.num_graph_samples = num_graph_samples
 
-    # ---------- Flow Matching 主损失 ----------
+        # 预处理邻接表，便于快速采样图正则中的边
+        self.neighbors = {}
+        if graph is not None:
+            for u in graph.nodes():
+                nbrs = list(graph.neighbors(u))
+                if len(nbrs) > 0:
+                    self.neighbors[int(u)] = [int(v) for v in nbrs]
 
-    def _flow_matching_loss(
-        self, z0: torch.Tensor, z1: torch.Tensor
-    ) -> tuple[torch.Tensor, dict]:
+    # --------- Flow Matching 部分 ---------
+
+    def _flow_matching_loss(self, z0: Tensor, z1: Tensor) -> Tuple[Tensor, Dict[str, float]]:
         """
-        只实现 L_FM（式 (19)-(23)）:
+        实现论文中沿 geodesic 的条件 Flow Matching：
 
-          1. t ~ Unif[0,1]
-          2. v_01 = Log_K_{z0}(z1)
-          3. z_t = Exp_K_{z0}( t * v_01 )
-          4. s_t = PT_{z0→z_t}(v_01)
-          5. f̂_θ(z_t, t)
-          6. 用 Riemann 度量做 MSE
-
-        每一步都做 nan_to_num / clamp，避免 NaN / Inf。
+        步骤:
+          1) 采样 t ~ Uniform(0,1)，避免 0 和 1 数值不稳定，做一次 clamp。
+          2) 在 z0->z1 的 geodesic 上找到中间点 z_t:
+                log01 = log_{z0}(z1)
+                z_t   = exp_{z0}( t * log01 )
+          3) 构造目标向量场:
+                u_t = log_{z_t}(z1) / (1 - t)
+          4) 用 Lorentz 范数平方做 MSE:
+                L_fm = E[ || v_theta(z_t, t) - u_t ||_L^2 ]
         """
         device = z0.device
-        N, D = z0.shape
+        N = z0.size(0)
+        K = self.K
 
-        # 防御性清洗：输入先灭一次 NaN/Inf
-        z0 = torch.nan_to_num(z0, nan=0.0, posinf=1e3, neginf=-1e3)
-        z1 = torch.nan_to_num(z1, nan=0.0, posinf=1e3, neginf=-1e3)
+        # 1) 采样 t
+        t = torch.rand(N, 1, device=device)
+        t = t.clamp(1e-3, 1.0 - 1e-3)  # 避免 0 和 1
 
-        # (1) t ~ U[0,1]
-        t = torch.rand(N, device=device)
+        # 2) geodesic 中点
+        log01 = log_map(z0, z1, K)          # (N, D) in T_{z0}
+        z_t = exp_map(z0, t * log01, K)     # (N, D)
 
-        # (2) 初始对数映射 v_01 ∈ T_{z0}
-        v01 = log_map(z0, z1, self.K)
-        v01 = torch.nan_to_num(v01, nan=0.0, posinf=1e3, neginf=-1e3)
+        # 3) 目标向量场 u_t
+        log_t1 = log_map(z_t, z1, K)        # T_{z_t}
+        u_t = log_t1 / (1.0 - t)            # (N, D)
 
-        # (3) 沿测地线插值，得到 z_t
-        v01_t = t.unsqueeze(-1) * v01               # (N, D)
-        zt = exp_map(z0, v01_t, self.K)             # (N, D)
-        zt = torch.nan_to_num(zt, nan=0.0, posinf=1e3, neginf=-1e3)
+        # 4) 模型预测 + MSE in Lorentz norm
+        v_pred = self.vf(z_t, t)            # (N, D)
+        v_pred = project_to_tangent(z_t, v_pred, K)
 
-        # (4) 平行移动得到监督速度 s_t ∈ T_{z_t}
-        st = parallel_transport(z0, zt, v01, self.K)
-        st = torch.nan_to_num(st, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        # (5) 模型输出：已在切空间
-        ft = self.vf(zt, t)
-        ft = torch.nan_to_num(ft, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        # (6) Riemannian MSE: || f̂_θ(z_t, t) - s_t ||_{g_{z_t}}^2
-        diff = ft - st                               # (N, D)
+        diff = v_pred - u_t
         diff = torch.nan_to_num(diff, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        diff_norm_sq = lorentz_norm_sq(diff)         # (N,)
-        diff_norm_sq = torch.clamp(diff_norm_sq, min=0.0, max=100.0)
-
-        loss_fm = diff_norm_sq.mean()
+        loss_fm = lorentz_norm_sq(diff).mean()
 
         stats = {
-            "loss_fm": float(loss_fm.detach().cpu().item()),
+            "loss_fm": float(loss_fm.detach().cpu().item())
         }
         return loss_fm, stats
 
+    # --------- 图正则部分 ---------
 
-    # ---------- Graph regularization ----------
-
-    def _graph_regularization(
-        self,
-        z0: torch.Tensor,
-        node_idx: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, dict]:
+    def _graph_smoothness_loss(self, node_idx: Tensor) -> Tuple[Tensor, Dict[str, float]]:
         """
-        实现论文 3.3.4 的图结构正则 L_graph，公式 (24)-(27) 的一个直接版本：
-
-          * 对每个样本对应的目标节点 v，取其邻居 N(v)
-          * 在 z0 处对所有邻居嵌入做 log-map 并平均，得到 v_agg (Eq. 24 的离散版本)
-          * 对 v_agg 做 geodesic 插值 + 平行移动，和 fθ 对齐
-
-        这里为了简化实现 & 数值稳定：
-          - 邻居权重采用均匀平均（都是 1/|N(v)|）
-          - 只对有邻居的样本做平均，其余样本不参与 L_graph
+        在图的边上做向量场平滑性约束：
+            L_graph = E_{(i,j)∈E} [ || v(z_i, t) - v(z_j, t) ||_L^2 ]
+        这里 t 固定取 0.5，采样若干对 (i,j)。
         """
-        device = z0.device
-        N, D = z0.shape
-
-        # 条件不满足时直接返回 0
         if (
-            self.lambda_graph == 0.0
-            or self.g is None
-            or self.z_all is None
+            self.lambda_graph <= 0.0
+            or self.graph is None
+            or self.all_embeddings is None
             or node_idx is None
+            or node_idx.numel() == 0
         ):
-            return z0.new_tensor(0.0), {"loss_graph": 0.0}
+            zero = torch.tensor(
+                0.0,
+                device=self.all_embeddings.device if self.all_embeddings is not None else node_idx.device,
+            )
+            return zero, {"loss_graph": 0.0}
 
-        z0 = torch.nan_to_num(z0, nan=0.0, posinf=1e3, neginf=-1e3)
+        device = self.all_embeddings.device
+        node_idx_list = node_idx.detach().cpu().numpy().tolist()
 
-        # v_agg 存放每个样本的邻居聚合方向（在 T_{z0}）
-        v_agg = torch.zeros_like(z0)
-        has_neighbor = torch.zeros(N, dtype=torch.bool, device=device)
-
-        for i in range(N):
-            v = int(node_idx[i].item())
-            if v not in self.g:
-                continue
-            neigh = list(self.g.neighbors(v))
-            if len(neigh) == 0:
-                continue
-
-            z0_i = z0[i].unsqueeze(0)                           # (1, D)
-            z_neigh = self.z_all[neigh].to(device)              # (M, D)
-            z0_expand = z0_i.expand(z_neigh.size(0), -1)        # (M, D)
-
-            logs = log_map(z0_expand, z_neigh, self.K)          # (M, D)
-            logs = torch.nan_to_num(logs, nan=0.0, posinf=1e3, neginf=-1e3)
-
-            v_agg[i] = logs.mean(dim=0)                         # (D,)
-            has_neighbor[i] = True
-
-        if not has_neighbor.any():
-            return z0.new_tensor(0.0), {"loss_graph": 0.0}
-
-        # 对 v_agg 做 geodesic 插值 + 平行移动，构造 s_t^(v)
-        t = torch.rand(N, device=device)
-        v_agg_t = t.unsqueeze(-1) * v_agg                       # (N, D)
-
-        zt = exp_map(z0, v_agg_t, self.K)                       # (N, D)
-        zt = torch.nan_to_num(zt, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        st = parallel_transport(z0, zt, v_agg, self.K)          # (N, D)
-        st = torch.nan_to_num(st, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        ft = self.vf(zt, t)                                     # (N, D)
-        ft = torch.nan_to_num(ft, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        diff = ft - st                                          # (N, D)
-        diff = torch.nan_to_num(diff, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        diff_norm_sq = lorentz_norm_sq(diff)                    # (N,)
-        diff_norm_sq = torch.clamp(diff_norm_sq, min=0.0, max=100.0)
-
-        if has_neighbor.any():
-            loss_graph = diff_norm_sq[has_neighbor].mean()
+        # 只在给定 node_idx 的子图上采样边，贴近论文的“局部社区”设定
+        if len(node_idx_list) > self.num_graph_samples:
+            centers = np.random.choice(node_idx_list, size=self.num_graph_samples, replace=False).tolist()
         else:
-            loss_graph = z0.new_tensor(0.0)
+            centers = node_idx_list
 
-        stats = {
-            "loss_graph": float(loss_graph.detach().cpu().item()),
-        }
+        pairs_u = []
+        pairs_v = []
+        for u in centers:
+            if u not in self.neighbors:
+                continue
+            nbrs = self.neighbors[u]
+            if len(nbrs) == 0:
+                continue
+            v = random.choice(nbrs)
+            pairs_u.append(u)
+            pairs_v.append(v)
+
+        if len(pairs_u) == 0:
+            zero = torch.tensor(0.0, device=device)
+            return zero, {"loss_graph": 0.0}
+
+        u_idx = torch.tensor(pairs_u, device=device, dtype=torch.long)
+        v_idx = torch.tensor(pairs_v, device=device, dtype=torch.long)
+
+        z_u = self.all_embeddings[u_idx]  # (M, D)
+        z_v = self.all_embeddings[v_idx]  # (M, D)
+        M = z_u.size(0)
+
+        t = torch.full((M, 1), 0.5, device=device)
+
+        v_u = self.vf(z_u, t)
+        v_v = self.vf(z_v, t)
+
+        v_u = project_to_tangent(z_u, v_u, self.K)
+        v_v = project_to_tangent(z_v, v_v, self.K)
+
+        diff = v_u - v_v
+        diff = torch.nan_to_num(diff, nan=0.0, posinf=1e3, neginf=-1e3)
+        loss_graph = lorentz_norm_sq(diff).mean()
+
+        stats = {"loss_graph": float(loss_graph.detach().cpu().item())}
         return loss_graph, stats
 
-
-    # ---------- 综合损失 ----------
+    # --------- 总损失 ---------
 
     def compute_loss_batch(
         self,
-        z0: torch.Tensor,
-        z1: torch.Tensor,
-        node_idx: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict]:
+        z0: Tensor,
+        z1: Tensor,
+        node_idx: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Dict[str, float]]:
         """
-        对外接口，保持和原始调用方式基本一致，只是多了一个 node_idx：
+        主入口：给训练脚本用。
 
-            loss, stats = trainer.compute_loss_batch(z0, z1, node_idx)
-
-        返回:
-          - loss: L = L_FM + λ_graph * L_graph
-          - stats: dict, 包含 'loss', 'loss_fm', 'loss_graph'
+        z0: (B, D) 从 seed 分布 p0 采样的点
+        z1: (B, D) 对应社区的真后验点 p1
+        node_idx: (B,) 或 (B,B0) 展平成 (B*B0,) 后作为图正则采样子图的范围
         """
-        # 先算 Flow Matching 主损失
         loss_fm, stats_fm = self._flow_matching_loss(z0, z1)
-        loss_graph, stats_graph = self._graph_regularization(z0, node_idx)
 
-        loss_total = loss_fm + self.lambda_graph * loss_graph
+        if node_idx is not None and self.lambda_graph > 0.0:
+            loss_graph, stats_graph = self._graph_smoothness_loss(node_idx)
+        else:
+            loss_graph = torch.tensor(0.0, device=z0.device)
+            stats_graph = {"loss_graph": 0.0}
+
+        loss = loss_fm + self.lambda_graph * loss_graph
 
         stats = {
-            "loss": float(loss_total.detach().cpu().item()),
-            "loss_fm": float(loss_fm.detach().cpu().item()),
-            "loss_graph": float(loss_graph.detach().cpu().item()),
+            "loss": float(loss.detach().cpu().item()),
+            "loss_fm": stats_fm["loss_fm"],
+            "loss_graph": stats_graph["loss_graph"],
         }
-
-        if not torch.isfinite(loss_total):
-            print("[!] Warning: loss is not finite (NaN or Inf) in compute_loss_batch")
-
-        return loss_total, stats
+        return loss, stats
 
 
-import torch
-
-from .hyperbolic_ops import exp_map
-
+# =======================================
+#  ODE 集成：评估时用的 integrate_flow
+# =======================================
 
 @torch.no_grad()
 def integrate_flow(
-    vf,
-    z0: torch.Tensor,
+    vf: HyperbolicVectorField,
+    z0: Tensor,
     K: float,
-    n_steps: int = 32,
-) -> torch.Tensor:
+    t0: float = 0.0,
+    t1: float = 1.0,
+    n_steps: int = 20,
+    step_size: Optional[float] = None,
+) -> Tensor:
     """
-    使用学习好的向量场 vf，在双曲空间上沿测地流动：
-        dz/dt = f_theta(z, t)
+    在双曲流场 v_theta 下，从 t0 积分到 t1：
+        dz/dt = v_theta(z, t)
+    使用显式 Euler 且每一步通过 exp_map 保证留在双曲面上。
 
-    输入:
-      vf: HyperbolicVectorField 实例
-      z0: (N, D) 源分布采样点 (在 H_{d,K} 上)
-      K:  曲率
-      n_steps: 数值积分步数 (越大越精细)
-
-    输出:
-      zT: (N, D) 终点锚点 (t=1)
+    参数设计兼容你当前的 eval 脚本：
+        integrate_flow(vf, z0, K_CURVATURE, t0=0.0, t1=1.0, n_steps=N_STEPS)
     """
     device = z0.device
-    zt = z0.clone()
-    t0, t1 = 0.0, 1.0
-    dt = (t1 - t0) / float(n_steps)
-    # 每个样本一条时间轴
-    t = torch.full((z0.size(0),), t0, device=device, dtype=z0.dtype)
+    z = project_to_manifold(z0, K)
 
+    if step_size is None:
+        dt = (t1 - t0) / float(n_steps)
+    else:
+        dt = step_size
+        # 根据 dt 重新计算步数（取整）
+        n_steps = max(1, int(abs((t1 - t0) / dt)))
+
+    t = t0
     for _ in range(n_steps):
-        # 向量场给出切空间中的速度
-        v = vf(zt, t)  # (N, D)
-        v = torch.nan_to_num(v, nan=0.0, posinf=1e3, neginf=-1e3)
+        t_tensor = torch.full((z.size(0), 1), t, device=device)
+        v = vf(z, t_tensor)
+        v = project_to_tangent(z, v, K)
 
-        # 在切空间走 dt，再用 Exp_map 映射回流形
-        zt = exp_map(zt, dt * v, K)
-        zt = torch.nan_to_num(zt, nan=0.0, posinf=1e3, neginf=-1e3)
+        # 在切空间中走一步，再用 exp_map 回到流形
+        z = exp_map(z, dt * v, K)
 
-        # 时间往前走
-        t = t + dt
+        t += dt
 
-    return zt
+    z = project_to_manifold(z, K)
+    return z
