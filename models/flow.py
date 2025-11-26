@@ -1,77 +1,94 @@
 # models/flow.py
-from typing import Optional, Dict, Any, List
+import math
+from typing import Optional, Dict, Any
 
 import torch
-from torch import nn, Tensor
+from torch import nn
 
 from .hyperbolic_ops import (
-    log_map,
-    exp_map,
-    hyperbolic_distance,
+    minkowski_inner,
     lorentz_norm_sq,
     project_to_tangent,
+    exp_map,
+    log_map,
+    hyperbolic_distance,
+    parallel_transport,
 )
 
+EPS = 1e-6
+
+
+# =========================
+#  向量场 v_θ(z, t)
+# =========================
 
 class HyperbolicVectorField(nn.Module):
     """
-    在洛伦兹模型 H_K 上定义的时间依赖向量场 v_theta(z, t)。
-    这里用一个 MLP 实现：输入是 [z, t]，输出是 T_z H_K 中的向量。
+    v_θ : H_{d,K} × [0,1] -> T_z H_{d,K}
+
+    实现方式：
+      - 直接把 (z, time_embed(t)) 拼在一起丢给一个 MLP
+      - 输出再投影回切空间 T_z H_{d,K}
     """
 
     def __init__(
         self,
-        dim: int,          # 欧氏维度 d，对应 H_K 中的维度 D = d+1
-        K: float = 1.0,
+        dim: int,
         hidden_dim: int = 128,
-        n_hidden: int = 2,
-    ):
+        time_embed_dim: int = 16,
+        K: float = 1.0,
+    ) -> None:
         super().__init__()
         self.dim = dim
-        self.D = dim + 1
-        self.K = K
+        self.K = float(K)
 
-        in_dim = self.D + 1  # z (D) + t (1)
-        layers: List[nn.Module] = []
-        h = in_dim
-        for _ in range(n_hidden):
-            layers.append(nn.Linear(h, hidden_dim))
-            layers.append(nn.Tanh())
-            h = hidden_dim
-        layers.append(nn.Linear(h, self.D))
-        self.mlp = nn.Sequential(*layers)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, time_embed_dim),
+            nn.Tanh(),
+        )
 
-        self.reset_parameters()
+        in_dim = dim + time_embed_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, dim),
+        )
 
-    def reset_parameters(self):
-        for m in self.mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, z: Tensor, t: Tensor) -> Tensor:
+    def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        z: (N, D) Lorentz 坐标，已经在 H_K 上
-        t: (N,) 或标量
-        返回: v(z,t) ∈ T_z H_K，形状 (N, D)
+        z: (N, D)  在 H_{d,K} 上的点
+        t: (N,) or (N,1)  时间
+        返回:
+          v_hat: (N, D)，已在 T_z H_{d,K} 上的切向量
         """
-        if t.dim() == 0:
-            t = t.expand(z.size(0))
-        t = t.view(-1, 1)  # (N,1)
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)            # (N,1)
+        t_feat = self.time_mlp(t)          # (N, time_embed_dim)
 
-        inp = torch.cat([z, t], dim=-1)  # (N, D+1)
-        v = self.mlp(inp)                # (N, D)
+        h = torch.cat([z, t_feat], dim=-1) # (N, dim+time_embed_dim)
+        v = self.net(h)                    # (N, dim)
 
-        # 投影到切空间，保证 <z, v>_L = 0
-        v = project_to_tangent(z, v)
-        return v
+        # 保证落在切空间
+        v_tan = project_to_tangent(z, v, self.K)
+        return v_tan
 
+
+# =========================
+#  Flow Matching Trainer
+# =========================
 
 class HyperbolicFlowTrainer:
     """
-    双曲流匹配训练器：
-    - Flow matching loss: 让 v_theta 逼近 geodesic 的切向量
-    - Graph smoothness loss（可选）: 让同一图中的邻居在嵌入上更接近
+    实现论文中的双曲 Flow Matching 损失 + 图正则项。
+
+    参数:
+      vf: HyperbolicVectorField
+      K:  曲率 K > 0
+      lambda_graph: 图正则的权重 λ_g
+      graph: (可选) networkx 图，用于图正则
+      all_embeddings: (可选) 所有节点的双曲嵌入 (N, D)，与图的节点索引对齐
     """
 
     def __init__(
@@ -80,135 +97,163 @@ class HyperbolicFlowTrainer:
         K: float = 1.0,
         lambda_graph: float = 0.0,
         graph=None,
-        all_embeddings: Optional[Tensor] = None,
-    ):
+        all_embeddings: Optional[torch.Tensor] = None,
+    ) -> None:
         self.vf = vf
-        self.K = K
+        self.K = float(K)
         self.lambda_graph = float(lambda_graph)
         self.graph = graph
-        self.all_embeddings = all_embeddings  # (N, D)
+        self.all_embeddings = all_embeddings
 
-        self._init_graph_cache()
-
-    # ---------- graph 信息预处理（用于 graph regularizer） ----------
-
-    def _init_graph_cache(self):
-        if self.graph is None:
-            self.num_nodes = None
+        # 为图正则预先构建邻居列表
+        if graph is not None:
+            import networkx as nx  # 只是为了强调依赖
+            self.neighbors = {u: list(graph.neighbors(u)) for u in graph.nodes()}
+        else:
             self.neighbors = None
-            return
 
-        g = self.graph
-        self.num_nodes = g.number_of_nodes()
-        # 假定节点已经是 0..N-1 的 int 索引
-        self.neighbors = {int(u): list(g.neighbors(u)) for u in g.nodes()}
+    # ---------- Flow Matching 主损失 ----------
 
-    # ---------- flow matching loss ----------
-
-    def _flow_matching_loss(self, z0: Tensor, z1: Tensor) -> (Tensor, Dict[str, float]):
+    def _flow_matching_loss(
+        self,
+        z0: torch.Tensor,    # (N, D)
+        z1: torch.Tensor,    # (N, D)
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
         """
-        z0 ~ p0, z1 ~ p1
+        用 geodesic(z0 -> z1) 构造真值向量场：
 
-        论文中的 geodesic flow matching 思想：
-        - v_01 = log_{z0}(z1)
-        - 采样 t ~ U(0,1)， z_t = exp_{z0}(t * v_01)
-        - 真正的向量场 v*(z_t, t) = v_01 （在 geodesic 上是常数）
-        - 用 MSE 匹配 v_theta(z_t, t) ≈ v_01
+          1. u_01 = log_{z0}(z1)
+          2. z_t  = Exp_{z0}(t * u_01)
+          3. v*(z_t,t) = PT_{z0->z_t}(u_01)
+          4. loss_fm   = E[ || v_θ(z_t,t) - v*(z_t,t) ||_L^2 ]
         """
         device = z0.device
-        N = z0.size(0)
+        N, D = z0.shape
+        K = self.K
 
-        # (N, D)
-        v01 = log_map(z0, z1, K=self.K)
+        # t ~ Uniform(0,1)，避免极端，稍微夹一下
+        t = torch.rand(N, device=device)
+        t = t.clamp(1e-3, 1.0 - 1e-3)           # (N,)
+        t_col = t.unsqueeze(-1)                 # (N,1)
 
-        # 采样时间 t
-        t = torch.rand(N, device=device)  # (N,)
+        # 1) geodesic 方向
+        u01 = log_map(z0, z1, K)               # (N, D) in T_{z0}
 
-        # geodesic 上的点 z_t
-        zt = exp_map(z0, t.unsqueeze(-1) * v01, K=self.K)  # (N, D)
+        # 2) geodesic 上的点 z_t
+        zt = exp_map(z0, t_col * u01, K)       # (N, D)
 
-        # 目标向量场（在 geodesic 上常数）
-        v_target = v01
+        # 3) 真值速度：沿 geodesic 平行运输 u01
+        v_star = parallel_transport(z0, zt, u01, K)  # (N, D)
 
-        # 模型预测向量场
-        v_pred = self.vf(zt, t)  # (N, D)
+        # 4) 模型预测
+        v_hat = self.vf(zt, t)                 # (N, D)
 
-        diff = v_pred - v_target
-        loss = torch.mean(torch.sum(diff * diff, dim=-1))  # L2
+        diff = v_hat - v_star                  # (N, D)
+        # 洛伦兹范数平方（切向量应为正）
+        diff_sq = torch.clamp(minkowski_inner(diff, diff), min=0.0)  # (N,)
+
+        loss_fm = diff_sq.mean()
 
         stats = {
-            "loss_fm": float(loss.detach().cpu().item()),
+            "loss_fm": float(loss_fm.detach().cpu().item()),
         }
-        return loss, stats
+        return loss_fm, stats
 
-    # ---------- graph smoothness 正则（可选） ----------
+    # ---------- 图正则项 ----------
 
-    def _graph_smoothness_loss(self, node_idx: Tensor) -> Tensor:
+    def _graph_loss(
+        self,
+        node_idx: torch.Tensor,   # (B,)
+        t: torch.Tensor,          # (B,) 对应每个节点的时间
+    ) -> tuple[torch.Tensor, float]:
         """
-        一个非常简单的图正则：让邻居在 H_K 上距离更小。
-        small 版训练可以直接把 lambda_graph 设为 0，不会用到这个。
+        一个简单的图正则：
+          对每个节点 i，随机选一个邻居 j，
+          惩罚 v_θ(z_i, t) 与 v_θ(z_j, t) 的差异：
+            L_graph = E[ || v_θ(z_i,t) - v_θ(z_j,t) ||_L^2 ]
         """
-        if self.lambda_graph <= 0.0:
-            return torch.tensor(0.0, device=node_idx.device)
-
         if (
             self.graph is None
-            or self.neighbors is None
             or self.all_embeddings is None
+            or self.neighbors is None
+            or self.lambda_graph <= 0.0
         ):
-            return torch.tensor(0.0, device=node_idx.device)
+            zero = torch.tensor(0.0, device=node_idx.device)
+            return zero, 0.0
 
         device = self.all_embeddings.device
-        z_all = self.all_embeddings.to(device)
+        K = self.K
 
-        losses: List[Tensor] = []
-        # node_idx: (B,)，是 batch 内目标节点的全局 id（0..N-1）
-        for nid in node_idx.detach().cpu().tolist():
-            nid = int(nid)
-            neigh = self.neighbors.get(nid, [])
-            if not neigh:
-                continue
+        # 当前 batch 的节点嵌入
+        z = self.all_embeddings[node_idx]      # (B, D)
 
-            # 最多取 5 个邻居
-            m = min(len(neigh), 5)
-            import random
+        # 为每个节点采一个邻居（如果没有邻居，就标记为无效）
+        neigh_ids = []
+        valid_mask = []
+        for nid in node_idx.tolist():
+            neighs = self.neighbors.get(nid, [])
+            if len(neighs) == 0:
+                neigh_ids.append(nid)
+                valid_mask.append(0)
+            else:
+                import random
+                neigh_ids.append(random.choice(neighs))
+                valid_mask.append(1)
 
-            sampled = random.sample(neigh, m)
-            z_c = z_all[nid].unsqueeze(0)  # (1,D)
-            z_n = z_all[torch.tensor(sampled, device=device, dtype=torch.long)]  # (m,D)
+        neigh_ids = torch.tensor(neigh_ids, dtype=torch.long, device=device)  # (B,)
+        valid_mask = torch.tensor(valid_mask, dtype=torch.bool, device=device)
+        z_neigh = self.all_embeddings[neigh_ids]  # (B, D)
 
-            d = hyperbolic_distance(z_c.expand_as(z_n), z_n, K=self.K)  # (m,)
-            losses.append(torch.mean(d * d))
+        # 用相同的时间 t（detach，图正则不需要对 t 求梯度）
+        if t.dim() == 1:
+            t_vec = t
+        else:
+            t_vec = t.squeeze(-1)
+        t_vec = t_vec.detach()
 
-        if not losses:
-            return torch.tensor(0.0, device=device)
+        v_z = self.vf(z, t_vec)          # (B, D)
+        v_neigh = self.vf(z_neigh, t_vec)
 
-        return torch.mean(torch.stack(losses))
+        diff = v_z - v_neigh
+        diff_sq = torch.clamp(minkowski_inner(diff, diff), min=0.0)  # (B,)
 
-    # ---------- 对外接口 ----------
+        if valid_mask.any():
+            loss_graph = diff_sq[valid_mask].mean()
+        else:
+            loss_graph = torch.tensor(0.0, device=device)
+
+        return loss_graph, float(loss_graph.detach().cpu().item())
+
+    # ---------- 对外接口：单 batch loss ----------
 
     def compute_loss_batch(
         self,
-        z0: Tensor,
-        z1: Tensor,
-        node_idx: Optional[Tensor] = None,
-    ) -> (Tensor, Dict[str, float]):
+        z0: torch.Tensor,         # (N, D)
+        z1: torch.Tensor,         # (N, D)
+        node_idx: Optional[torch.Tensor] = None,  # (N,) 对应 z1 的节点 id
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
         """
-        z0, z1: (N, D) 在 H_K 上
-        node_idx: (N,) 对应 z1 的全局节点索引，用于图正则（可选）
+        组合：
+          L = L_fm + λ_g * L_graph
         """
-        loss_fm, stats_fm = self._flow_matching_loss(z0, z1)
+        device = z0.device
 
+        # Flow Matching 主损失
+        loss_fm, stats = self._flow_matching_loss(z0, z1)
+
+        # 图正则
         if self.lambda_graph > 0.0 and node_idx is not None:
-            loss_graph = self._graph_smoothness_loss(node_idx)
+            t_graph = torch.rand(z0.shape[0], device=device).clamp(1e-3, 1.0 - 1e-3)
+            loss_graph, lg_val = self._graph_loss(node_idx, t_graph)
         else:
-            loss_graph = torch.tensor(0.0, device=z0.device)
+            loss_graph = torch.tensor(0.0, device=device)
+            lg_val = 0.0
 
-        total = loss_fm + self.lambda_graph * loss_graph
+        loss = loss_fm + self.lambda_graph * loss_graph
 
-        stats = {
-            "loss": float(total.detach().cpu().item()),
-            "loss_fm": float(loss_fm.detach().cpu().item()),
-            "loss_graph": float(loss_graph.detach().cpu().item()),
+        out_stats = {
+            "loss": float(loss.detach().cpu().item()),
+            "loss_fm": stats["loss_fm"],
+            "loss_graph": lg_val,
         }
-        return total, stats
+        return loss, out_stats
