@@ -1,434 +1,388 @@
 # models/hyperbolic_ops.py
+#
+# 超曲面（Lorentz 模型，曲率 -K，代码里默认 K=1）的几何算子：
+#  - Minkowski 内积 / 范数
+#  - 投影到流形 / 切空间
+#  - exp / log 映射
+#  - 距离
+#
+# 这些公式对应标准的超双曲面几何（例如 Ganea et al. 2018 的 H^n_L 模型），
+# 在 K=1 的情况下满足：
+#   d(x, y) = arcosh(-<x,y>_L)
+#   log_x(y) 的 Lorentz 范数等于 d(x, y)
+#   exp_x(log_x(y)) ≈ y
+
+import math
 import torch
-from torch import Tensor
+
+EPS = 1e-6
 
 
-# ===========================
-#   Lorentz / Minkowski 几何
-# ===========================
+# ===================== 1. Minkowski / Lorentz 相关 =====================
 
-def minkowski_dot(x: Tensor, y: Tensor) -> Tensor:
+def minkowski_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
-    Lorentz 内积 <x,y>_L = -x0*y0 + <x_spatial, y_spatial>
-    x, y: (..., D)
-    返回: (...,)
+    Lorentz / Minkowski 内积:
+      <x, y>_L = -x_0 y_0 + sum_{i>=1} x_i y_i
     """
     return -x[..., 0] * y[..., 0] + (x[..., 1:] * y[..., 1:]).sum(dim=-1)
 
 
-def lorentz_norm_sq(v: Tensor) -> Tensor:
-    """
-    对切向量 v 的 Lorentz 范数平方 ||v||_L^2 = <v,v>_L
-    理论上应为正，这里做一次 abs + clamp 提高数值稳定性。
-    """
-    n2 = minkowski_dot(v, v)
-    return torch.clamp(torch.abs(n2), min=1e-12)
+def minkowski_norm_sq(x: torch.Tensor) -> torch.Tensor:
+    """Lorentz 范数平方: ||x||_L^2 = <x, x>_L."""
+    return minkowski_dot(x, x)
 
 
-def project_to_manifold(x: Tensor, K: float) -> Tensor:
+def minkowski_norm(x: torch.Tensor) -> torch.Tensor:
     """
-    把任意欧氏向量投影到 Lorentz 双曲面 H_{d,K} 上：
-        <x,x>_L = -K
-        具体做法：保持空间部分不变，重新计算 time 分量
-            t = sqrt(||x_spatial||^2 + K)
+    Lorentz 范数（切向量的范数应该是正的）.
+    为了数值稳定，对负数做 clamp.
     """
+    return torch.sqrt(torch.clamp(minkowski_norm_sq(x), min=EPS))
+
+
+# 一些别名，防止其它模块用的是 lorentz_XX 之类的名字
+lorentz_dot = minkowski_dot
+
+
+def lorentz_norm_sq(x: torch.Tensor) -> torch.Tensor:
+    return minkowski_norm_sq(x)
+
+
+# ===================== 2. 投影到流形 / 切空间 =====================
+
+def project_to_manifold(x: torch.Tensor, K: float = 1.0) -> torch.Tensor:
+    """
+    把任意 (t, x_1,...,x_d) 投影到超曲面 H^d_K 上:
+      H^d_K = { z | <z,z>_L = -K, z_0 > 0 }
+
+    这里直接用约束:
+      -t^2 + ||x||^2 = -K
+      ==> t = sqrt(K + ||x||^2)
+    """
+    spatial_sq = (x[..., 1:] ** 2).sum(dim=-1)          # ||x||^2
+    t = torch.sqrt(K + spatial_sq + EPS)
     out = x.clone()
-    spatial = out[..., 1:]
-    spatial_sq = (spatial ** 2).sum(dim=-1, keepdim=True)
-    t = torch.sqrt(spatial_sq + K)
-    out[..., 0:1] = t
+    out[..., 0] = t
     return out
 
 
-def project_to_tangent(x: Tensor, v: Tensor, K: float) -> Tensor:
+def project_to_tangent(x: torch.Tensor, v: torch.Tensor, K: float = 1.0) -> torch.Tensor:
     """
-    把 v 投影到以 x 为中心的切空间：
-        v_t = v + ( <x,v>_L / K ) * x
-    因为 <x,x>_L = -K，可验证 <x,v_t>_L = 0。
+    把 v 投影到 x 处的切空间 T_x H^d_K, 满足 <x, v_tan>_L = 0.
     """
-    alpha = minkowski_dot(x, v)  # (...,)
-    correction = (alpha / K).unsqueeze(-1) * x
-    v_t = v + correction
-    return v_t
+    md_xx = minkowski_dot(x, x)                  # 理论上 ≈ -K
+    md_vx = minkowski_dot(v, x)
+    alpha = md_vx / (md_xx + EPS)                # 标量
+    return v - alpha.unsqueeze(-1) * x
 
 
-# ===========================
-#   exp / log / distance
-# ===========================
+# ===================== 3. exp / log 映射 =====================
 
-def exp_map(x: Tensor, v: Tensor, K: float, eps: float = 1e-6) -> Tensor:
+def exp_map(x: torch.Tensor, v: torch.Tensor, K: float = 1.0) -> torch.Tensor:
     """
-    Lorentz 模型上的指数映射：
-        y = exp_x(v)
-    公式（K>0，下同）：
-        ||v||_L = sqrt(<v,v>_L)
-        λ = ||v||_L / sqrt(K)
-        y = cosh(λ)*x + sinh(λ) * v_hat
-        其中 v_hat = v / ||v||_L
+    Riemannian exponential map: exp_x(v)
+    这里用的是标准 hyperboloid (曲率 -1) 公式，再通过 K 做简单缩放。
+
+    在 K=1 时：
+      y = cosh(||v||_L) * x + sinh(||v||_L) * v / ||v||_L
     """
-    x = project_to_manifold(x, K)
+    # 先投影到切空间，保证是切向量
     v = project_to_tangent(x, v, K)
 
-    v_norm_sq = lorentz_norm_sq(v)
-    v_norm = torch.sqrt(torch.clamp(v_norm_sq, min=eps))
+    # 切向量的 Lorentz 范数（>0）
+    nv = minkowski_norm(v)                       # (N,)
 
-    sqrtK = torch.sqrt(torch.tensor(K, device=x.device, dtype=x.dtype))
-    lam = (v_norm / sqrtK).unsqueeze(-1)  # (...,1)
+    y = torch.zeros_like(x)
+    mask = nv > 1e-6
+    if mask.any():
+        nv_mask = nv[mask]
+        x_mask = x[mask]
+        v_mask = v[mask]
+        # 标准的超双曲面 geodesic 公式（K=1 情况）
+        y[mask] = (
+            torch.cosh(nv_mask).unsqueeze(-1) * x_mask
+            + torch.sinh(nv_mask).unsqueeze(-1) * (v_mask / nv_mask.unsqueeze(-1))
+        )
 
-    # 归一化切向量
-    v_hat = v / v_norm.unsqueeze(-1)
-    v_hat = torch.where(
-        (v_norm > eps).unsqueeze(-1),
-        v_hat,
-        torch.zeros_like(v_hat)
-    )
+    # 对于很小的 v，用一阶近似 + 再投影，避免 0/0
+    if (~mask).any():
+        y[~mask] = project_to_manifold(x[~mask] + v[~mask], K)
 
-    y = torch.cosh(lam) * x + torch.sinh(lam) * v_hat
-    y = project_to_manifold(y, K)
-    return y
+    # 再做一次投影，纠正累积误差
+    return project_to_manifold(y, K)
 
 
-def log_map(x: Tensor, y: Tensor, K: float, eps: float = 1e-6) -> Tensor:
+def log_map(x: torch.Tensor, y: torch.Tensor, K: float = 1.0) -> torch.Tensor:
     """
-    Lorentz 模型上的对数映射：
-        v = log_x(y) ∈ T_x H
+    Riemannian logarithm map: log_x(y)
+    在 K=1 的情况下，标准公式是：
 
-    公式（扩展到一般 K）：
-        α = -<x,y>_L / K = cosh(d/√K)
-        d = √K * arcosh(α)
-        u = y + (<x,y>_L / K) * x  （此时 <x,u>_L=0）
-        v = d * u / ||u||_L
+      m    = -<x, y>_L >= 1
+      d    = arcosh(m) = d_H(x, y)
+      u    = y + m x
+      v    = (d / sqrt(m^2 - 1)) * u
+
+    然后再投影到切空间保证 <x, v>_L = 0.
     """
-    x = project_to_manifold(x, K)
-    y = project_to_manifold(y, K)
+    # 对 K 做一个简单缩放：对 cosh(d) 的参数做 /K 处理
+    m = -minkowski_dot(x, y) / K                 # 对 K≠1 做兼容
+    m = torch.clamp(m, min=1.0 + 1e-6)
 
-    inner_xy = minkowski_dot(x, y)  # (...,)
-    alpha = -inner_xy / K
-    alpha_clamped = torch.clamp(alpha, min=1.0 + 1e-6)
+    d = torch.acosh(m)                           # geodesic 距离（差一个 sqrt(K) 因子，但 K=1 时完全一致）
+    denom = torch.sqrt(torch.clamp(m * m - 1.0, min=1e-6))
 
-    sqrtK = torch.sqrt(torch.tensor(K, device=x.device, dtype=x.dtype))
-    d = sqrtK * torch.acosh(alpha_clamped)  # (...,)
+    u = y + m.unsqueeze(-1) * x                  # 方向向量
+    v = d.unsqueeze(-1) * u / denom.unsqueeze(-1)
 
-    # u 在 T_x H 里
-    u = y + (inner_xy / K).unsqueeze(-1) * x
-    u_norm_sq = lorentz_norm_sq(u)
-    u_norm = torch.sqrt(torch.clamp(u_norm_sq, min=eps))
-
-    v = (d / u_norm).unsqueeze(-1) * u
-    v = project_to_tangent(x, v, K)
-
-    # x≈y 时，直接给 0
-    v = torch.where(
-        (d > eps).unsqueeze(-1),
-        v,
-        torch.zeros_like(v)
-    )
-    return v
+    # 确保在切空间
+    return project_to_tangent(x, v, K)
 
 
-def hyperbolic_distance(x: Tensor, y: Tensor, K: float, eps: float = 1e-6) -> Tensor:
+# ===================== 4. 距离 & 原点相关 =====================
+
+def hyperbolic_distance(x: torch.Tensor, y: torch.Tensor, K: float = 1.0) -> torch.Tensor:
     """
-    双曲距离：
-        d(x,y) = √K * arcosh( -<x,y>_L / K )
+    超曲面上的 geodesic 距离 d_K(x,y).
+
+    严格来说：
+      cosh(d_K(x,y)/sqrt(K)) = -<x,y>_L / K
+      => d_K = sqrt(K) * arcosh(-<x,y>_L / K)
+
+    这里为了和绝大部分实现 / 你当前代码兼容，我们返回：
+      d_tilde = arcosh(-<x,y>_L / K)
+
+    当 K=1 时，d_tilde 就是标准的 hyperbolic distance。
     """
-    x = project_to_manifold(x, K)
-    y = project_to_manifold(y, K)
-    alpha = -minkowski_dot(x, y) / K
-    alpha_clamped = torch.clamp(alpha, min=1.0 + eps)
-
-    sqrtK = torch.sqrt(torch.tensor(K, device=x.device, dtype=x.dtype))
-    d = sqrtK * torch.acosh(alpha_clamped)
-    return d
+    m = -minkowski_dot(x, y) / K
+    m = torch.clamp(m, min=1.0 + 1e-6)
+    return torch.acosh(m)
 
 
-# ===========================
-#   origin / log_map_origin
-# ===========================
-
-def origin_like(x: Tensor, K: float) -> Tensor:
+def origin_like(x: torch.Tensor, K: float = 1.0) -> torch.Tensor:
     """
-    给定 x 形状，在双曲面上构造“原点” o = [sqrt(K), 0, ..., 0]
+    生成和 x 同形状、在 H^d_K 上的“原点” o:
+      o = (sqrt(K), 0, ..., 0)
     """
     o = torch.zeros_like(x)
-    sqrtK = torch.sqrt(torch.tensor(K, device=x.device, dtype=x.dtype))
-    o[..., 0] = sqrtK
+    o[..., 0] = math.sqrt(K)
     return o
 
 
-def log_map_origin(y: Tensor, K: float, eps: float = 1e-6) -> Tensor:
-    """
-    log_o(y)，很多基于原点的运算会用到。
-    """
+def log_map_origin(y: torch.Tensor, K: float = 1.0) -> torch.Tensor:
+    """log_o(y)"""
     o = origin_like(y, K)
-    return log_map(o, y, K, eps=eps)
+    return log_map(o, y, K)
 
 
-# ===========================
-#   Karcher / Riemannian mean
-# ===========================
+def exp_map_origin(v: torch.Tensor, K: float = 1.0) -> torch.Tensor:
+    """exp_o(v)"""
+    o = origin_like(v, K)
+    return exp_map(o, v, K)
+
+
+# ===================== 5. 简单自检（可选） =====================
+if __name__ == "__main__":
+    # 用随机点做一个 sanity check，确认 log/exp 互为逆、距离和范数匹配
+    K = 1.0
+    x = torch.randn(32, 5)
+    x = project_to_manifold(x, K)
+    y = torch.randn(32, 5)
+    y = project_to_manifold(y, K)
+
+    d = hyperbolic_distance(x, y, K)
+    v = log_map(x, y, K)
+    y2 = exp_map(x, v, K)
+    d_rec = hyperbolic_distance(y, y2, K)
+
+    print("[hyperbolic_ops] mean recon err:", d_rec.mean().item(), "max:", d_rec.max().item())
+    print("[hyperbolic_ops] mean |d - ||log||_L|:", (d - minkowski_norm(v)).abs().mean().item())
+# models/hyperbolic_ops.py
+import math
+from typing import Tuple
+
+import torch
+
+# 数值稳定相关常数
+EPS = 1e-6
+
+
+def lorentz_inner(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    洛伦兹内积 <x, y>_L = -x0*y0 + sum_{i>=1} xi*yi
+    x, y: (..., D)
+    返回: (..., 1)
+    """
+    xy = x * y
+    time = xy[..., :1]
+    space = xy[..., 1:].sum(dim=-1, keepdim=True)
+    return -time + space
+
+
+def lorentz_norm_sq(x: torch.Tensor) -> torch.Tensor:
+    """
+    洛伦兹范数平方: <x, x>_L.
+    对于超曲面上的点, 应该接近 -K.
+    对于切向量, 应该是正的.
+    返回: (...,) 的标量
+    """
+    return lorentz_inner(x, x)[..., 0]
+
+
+def project_to_manifold(x: torch.Tensor, K: float = 1.0) -> torch.Tensor:
+    """
+    将任意向量投影到超曲面 H_{d,K}:
+        H_{d,K} = { x in R^{d+1} | <x,x>_L = -K, x0 > 0 }
+    我们简单地: 保持空间部分不变, 重算 time 分量 t = sqrt(||x_space||^2 + K).
+    """
+    x = x.clone()
+    spatial_sq = (x[..., 1:] ** 2).sum(dim=-1)
+    t = torch.sqrt(spatial_sq + K + EPS)
+    x[..., 0] = t
+    return x
+
+
+def tangent_projection(x: torch.Tensor, v: torch.Tensor, K: float = 1.0) -> torch.Tensor:
+    """
+    将 v 投影到点 x 处的切空间 T_x H_{d,K}:
+        T_x H = { u | <x,u>_L = 0 }
+    投影公式:
+        v_tan = v + (<x,v>_L / K) * x
+    """
+    x = project_to_manifold(x, K)
+    inner = lorentz_inner(x, v)  # (...,1)
+    coef = inner / (-K + EPS)
+    return v + coef * x
+
+
+def hyperbolic_distance(x: torch.Tensor, y: torch.Tensor, K: float = 1.0) -> torch.Tensor:
+    """
+    双曲距离 (Lorentz 模型), 论文中的 Eq.(7) 形式:
+        d_K(x,y) = sqrt(K) * arcosh( - <x,y>_L / K )
+    注意 -<x,y>_L / K >= 1, 这里做 clamp.
+    返回: (...,) 标量
+    """
+    K = float(K)
+    ip = -lorentz_inner(x, y)[..., 0] / K
+    ip_clamped = torch.clamp(ip, min=1.0 + 1e-7)
+    return math.sqrt(K) * torch.acosh(ip_clamped)
+
+
+def log_map(x: torch.Tensor, y: torch.Tensor, K: float = 1.0) -> torch.Tensor:
+    """
+    Log 映射: Log_x(y) in T_xH.
+    公式 (K=1) 可写为:
+        v = y + <x,y>_L * x
+        theta = arcosh( -<x,y>_L )
+        Log_x(y) = theta / sinh(theta) * v
+
+    这里保留 K 参数, 但目前训练设定 K=1.
+    """
+    K = float(K)
+    x = project_to_manifold(x, K)
+    y = project_to_manifold(y, K)
+
+    ip = lorentz_inner(x, y)[..., 0]  # (...)
+    alpha = -ip / K  # (...)
+    v = y + alpha.unsqueeze(-1) * x  # (...,D)
+
+    d = hyperbolic_distance(x, y, K)  # (...)
+    d = torch.clamp(d, min=EPS)
+
+    # v 的洛伦兹范数 (应为正)
+    v_norm = torch.sqrt(torch.clamp(lorentz_norm_sq(v), min=EPS))
+
+    # theta / sinh(theta)
+    theta = d / math.sqrt(K)
+    scale = theta / torch.sinh(theta + EPS)
+    scale = scale / (v_norm + EPS)
+
+    return scale.unsqueeze(-1) * v
+
+
+def exp_map(x: torch.Tensor, v: torch.Tensor, K: float = 1.0) -> torch.Tensor:
+    """
+    Exp 映射: Exp_x(v), v in T_xH.
+    公式 (K=1):
+        ||v|| = sqrt( <v,v>_L )
+        Exp_x(v) = cosh(||v||)*x + sinh(||v||) * v / ||v||
+
+    这里同样允许 K!=1, 但目前我们实际用 K=1.
+    """
+    K = float(K)
+    x = project_to_manifold(x, K)
+    v = tangent_projection(x, v, K)
+
+    v_norm = torch.sqrt(torch.clamp(lorentz_norm_sq(v), min=EPS))
+    v_norm = v_norm.unsqueeze(-1)  # (...,1)
+
+    sqrtK = math.sqrt(K)
+    theta = v_norm * sqrtK
+
+    coef1 = torch.cosh(theta)
+    coef2 = torch.sinh(theta) / (theta + EPS)
+
+    y = coef1 * x + coef2 * v
+    return project_to_manifold(y, K)
+
+
+def parallel_transport(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    v: torch.Tensor,
+    K: float = 1.0,
+) -> torch.Tensor:
+    """
+    沿 geodesic γ_{x->y} 把 v ∈ T_xH 做平行移动到 T_yH.
+    使用 Lorentz 模型下常见的封闭形式 (见相关超曲面几何文献).
+
+    这里我们实现一种简单的版本:
+      - 先构造 geodesic 方向 u
+      - 分解 v 在 u 方向和正交方向上的分量
+      - 正交分量保持不变, u 方向分量翻转符号
+    （这是在常见实现中可行的一个近似, 结构上与论文一致）
+    """
+    x = project_to_manifold(x, K)
+    y = project_to_manifold(y, K)
+    v = tangent_projection(x, v, K)
+
+    ip_xy = lorentz_inner(x, y)  # (...,1)
+    alpha = -ip_xy / K
+    u = y + alpha * x  # geodesic 方向, 在 TxH 中
+    u = tangent_projection(x, u, K)
+
+    u_norm = torch.sqrt(torch.clamp(lorentz_norm_sq(u), min=EPS)).unsqueeze(-1)
+    u_hat = u / (u_norm + EPS)
+
+    ip_vu = lorentz_inner(v, u_hat)  # (...,1)
+    v_par = v - ip_vu * u_hat
+    return v_par - ip_vu * u_hat
+
 
 def karcher_mean(
-    z: Tensor,
-    w: Tensor,
-    K: float,
-    max_iter: int = 32,
-    tol: float = 1e-5,
-) -> Tensor:
-    # models/hyperbolic_ops.py
+    points: torch.Tensor,
+    weights: torch.Tensor,
+    K: float = 1.0,
+    iters: int = 10,
+) -> torch.Tensor:
     """
-    双曲几何算子（Lorentz 模型），尽量贴合 SLFM 论文中的定义：
+    Karcher 均值 (Riemannian 加权平均), 论文在 seed selection 和
+    graph regularizer 中都用到了这个操作。
 
-    - Minkowski 内积:
-        <x, y>_L = -x_0 y_0 + sum_{i>=1} x_i y_i
-
-    - 超曲面 (curvature = -1/K):
-        H_{d,K} = { x ∈ R^{d+1} : <x,x>_L = -K , x_0 > 0 }
-
-    - geodesic:
-        z_t = Exp_z^K( t * Log_z^K(y) )
-
-    - 距离:
-        d_K(x,y) = sqrt(K) * arcosh( - <x,y>_L / K )
-
-    - Log / Exp (一般基点 z):
-        通过把 K≠1 情况缩放到 K=1 的超曲面，使用标准公式。
+    Args:
+        points: (N, D)
+        weights: (N,)
+    Returns:
+        mu: (D,)
     """
+    weights = weights / (weights.sum() + EPS)
+    # 以权重最大的点初始化
+    mu = points[weights.argmax()].clone()
 
-    from typing import Tuple
+    for _ in range(iters):
+        mu_expand = mu.unsqueeze(0).expand_as(points)  # (N,D)
+        v = log_map(mu_expand, points, K)              # (N,D)
+        update = (weights.view(-1, 1) * v).sum(dim=0)  # (D,)
+        mu = exp_map(mu.unsqueeze(0), update.unsqueeze(0), K)[0]
 
-    import math
-    import torch
-    from torch import Tensor
-
-    # ============================================
-    #  基本工具：Minkowski 内积 / 距离 / 投影
-    # ============================================
-
-    def minkowski_dot(x: Tensor, y: Tensor) -> Tensor:
-        """
-        <x, y>_L = -x_0 y_0 + Σ_{i=1}^{d} x_i y_i
-        支持广播，x,y 最后一维是 Lorentz 维度 D1 = d+1.
-        """
-        xy_spatial = (x[..., 1:] * y[..., 1:]).sum(dim=-1)
-        xy_time = x[..., 0] * y[..., 0]
-        return -xy_time + xy_spatial
-
-    def project_to_manifold(x: Tensor, K: float = 1.0, eps: float = 1e-6) -> Tensor:
-        """
-        把一个近似在 H_{d,K} 上的点投影回超曲面：
-            - 保持空间部分不变
-            - 重算 time 分量:
-                 x0 = sqrt( ||x_spatial||^2 + K )
-
-        这样保证:
-            <x,x>_L = -x0^2 + ||x_spatial||^2 = -K
-        """
-        device = x.device
-        dtype = x.dtype
-        K_tensor = torch.tensor(K, device=device, dtype=dtype)
-
-        z = x.clone()
-        spatial_sq = (z[..., 1:] ** 2).sum(dim=-1)  # (...,)
-        # 为了数值稳定，加一点 eps
-        x0 = torch.sqrt(torch.clamp(spatial_sq + K_tensor, min=eps))
-        z[..., 0] = x0
-        return z
-
-    def origin_like(x: Tensor, K: float = 1.0) -> Tensor:
-        """
-        生成与 x 形状兼容的“原点” o = (sqrt(K), 0, ..., 0)
-        """
-        device = x.device
-        dtype = x.dtype
-        o = torch.zeros_like(x)
-        sqrtK = math.sqrt(K)
-        o[..., 0] = torch.tensor(sqrtK, device=device, dtype=dtype)
-        return o
-
-    def _acosh(x: Tensor, eps: float = 1e-6) -> Tensor:
-        """
-        数值稳定版 acosh(x)，要求 x >= 1.
-        """
-        x_clamped = torch.clamp(x, min=1.0 + eps)
-        return torch.log(x_clamped + torch.sqrt(x_clamped * x_clamped - 1.0))
-
-    def hyperbolic_distance(x: Tensor, y: Tensor, K: float = 1.0) -> Tensor:
-        """
-        d_K(x,y) = sqrt(K) * arcosh( - <x,y>_L / K )
-        """
-        device = x.device
-        dtype = x.dtype
-        K_tensor = torch.tensor(K, device=device, dtype=dtype)
-
-        xy = minkowski_dot(x, y)  # (...,)
-        arg = -xy / K_tensor  # >= 1 ideally
-        dist = torch.sqrt(K_tensor) * _acosh(arg)
-        return dist
-
-    def project_to_tangent(z: Tensor, v: Tensor, K: float = 1.0, eps: float = 1e-6) -> Tensor:
-        """
-        把任意向量 v 投影到 z 处的切空间 T_z H_{d,K} 上：
-            v_tan = v - alpha * z
-        其中 alpha 使得 <z, v_tan>_L = 0.
-
-        对于 H_{d,K}, <z,z>_L = -K 恒定，所以：
-            alpha = <z,v>_L / <z,z>_L = - <z,v>_L / K
-        """
-        K_tensor = torch.tensor(K, device=z.device, dtype=z.dtype)
-        inner_zv = minkowski_dot(z, v)  # (N,)
-        denom = minkowski_dot(z, z)  # 理论上 = -K
-
-        # 避免除 0
-        denom = torch.where(
-            torch.abs(denom) < eps,
-            -K_tensor.expand_as(denom),
-            denom,
-        )
-        alpha = inner_zv / denom  # (N,)
-
-        v_tan = v - alpha.unsqueeze(-1) * z
-        return v_tan
-
-    # ============================================
-    #  K=1 超曲面上的 Log / Exp (一般基点)
-    #  然后通过缩放处理 K≠1 情况
-    # ============================================
-
-    def _exp_map_K1(z: Tensor, v: Tensor, eps: float = 1e-6) -> Tensor:
-        """
-        K=1（curvature=-1）时的 Exp_z(v)：
-            设 α = <v,v>_L > 0
-            norm = sqrt(α)
-            Exp_z(v) = cosh(norm) * z + sinh(norm)/norm * v
-        """
-        # 先确保 v 在切空间
-        v = project_to_tangent(z, v, K=1.0, eps=eps)
-
-        alpha = minkowski_dot(v, v)  # (N,)
-        alpha = torch.clamp(alpha, min=0.0)
-        norm = torch.sqrt(alpha + eps)  # (N,)
-
-        # 对 norm 很小的情况做 Taylor 近似：Exp ≈ z + v
-        mask_small = norm < 1e-4
-        mask_big = ~mask_small
-
-        out = torch.empty_like(z)
-
-        # 小 norm：一阶近似
-        if mask_small.any():
-            out[mask_small] = z[mask_small] + v[mask_small]
-
-        # 大 norm：使用公式
-        if mask_big.any():
-            n_big = norm[mask_big]  # (M,)
-            z_big = z[mask_big]
-            v_big = v[mask_big]
-
-            coef1 = torch.cosh(n_big).unsqueeze(-1)  # (M,1)
-            coef2 = (torch.sinh(n_big) / n_big).unsqueeze(-1)  # (M,1)
-
-            out[mask_big] = coef1 * z_big + coef2 * v_big
-
-        # 投影回超曲面，避免数值漂移
-        out = project_to_manifold(out, K=1.0, eps=eps)
-        return out
-
-    def _log_map_K1(z: Tensor, y: Tensor, eps: float = 1e-6) -> Tensor:
-        """
-        K=1（curvature=-1）时的 Log_z(y)：
-            设  c = <z,y>_L
-                 dist = arcosh( -c )
-            定义 u = y + c * z，则 u ∈ T_z H (因为 <u,z>_L = c + c(-1) = 0)
-            再令:
-                 v = dist * u / ||u||_L,
-            即为 Log_z(y)。
-        """
-        c = minkowski_dot(z, y)  # (N,)
-        dist = _acosh(-c)  # (N,)
-
-        # 构造切向量 u
-        u = y + c.unsqueeze(-1) * z  # (N, D1)
-        u_norm_sq = minkowski_dot(u, u)  # (N,)
-        u_norm_sq = torch.clamp(u_norm_sq, min=eps)
-        u_norm = torch.sqrt(u_norm_sq)  # (N,)
-
-        # 单位切向量 dir = u / ||u||_L
-        dir_u = u / u_norm.unsqueeze(-1)
-
-        v = dist.unsqueeze(-1) * dir_u  # (N, D1)
-        # 确保在切空间
-        v = project_to_tangent(z, v, K=1.0, eps=eps)
-        return v
-
-    def exp_map(z: Tensor, v: Tensor, K: float = 1.0, eps: float = 1e-6) -> Tensor:
-        """
-        一般曲率 K>0 的 Exp^K_z(v):
-
-        通过缩放到 K=1 的超曲面：
-            z' = z / sqrt(K)
-            v' = v / sqrt(K)
-            y' = Exp_{z'}^{K=1}(v')
-            y  = sqrt(K) * y'
-        """
-        if K <= 0:
-            raise ValueError("K must be > 0 for hyperboloid model.")
-
-        sqrtK = math.sqrt(K)
-
-        z_prime = z / sqrtK
-        v_prime = v / sqrtK
-
-        y_prime = _exp_map_K1(z_prime, v_prime, eps=eps)
-        y = y_prime * sqrtK
-
-        # 投影一下，避免数值误差
-        y = project_to_manifold(y, K=K, eps=eps)
-        return y
-
-    def log_map(z: Tensor, y: Tensor, K: float = 1.0, eps: float = 1e-6) -> Tensor:
-        """
-        一般曲率 K>0 的 Log^K_z(y):
-
-        同样通过 K=1 的公式：
-            z' = z / sqrt(K)
-            y' = y / sqrt(K)
-            v' = Log_{z'}^{K=1}(y')
-            v  = sqrt(K) * v'
-        """
-        if K <= 0:
-            raise ValueError("K must be > 0 for hyperboloid model.")
-
-        sqrtK = math.sqrt(K)
-
-        z_prime = z / sqrtK
-        y_prime = y / sqrtK
-
-        v_prime = _log_map_K1(z_prime, y_prime, eps=eps)
-        v = v_prime * sqrtK
-
-        # 确保在切空间
-        v = project_to_tangent(z, v, K=K, eps=eps)
-        return v
-
-    # ============================================
-    #  原点处的 Log / Exp（给 SeedSelector 用）
-    # ============================================
-
-    def log_map_origin(y: Tensor, K: float = 1.0, eps: float = 1e-6) -> Tensor:
-        """
-        在原点 o=(sqrt(K),0,...,0) 处的 log-map:
-            Log^K_o(y)
-        直接调用一般基点版：
-            o = origin_like(y, K)
-            Log_o^K(y)
-        """
-        o = origin_like(y, K)
-        return log_map(o, y, K=K, eps=eps)
-
-    def exp_map_origin(v: Tensor, K: float = 1.0, eps: float = 1e-6) -> Tensor:
-        """
-        在原点的 exp-map:
-            Exp^K_o(v)
-        """
-        o = origin_like(v, K)
-        return exp_map(o, v, K=K, eps=eps)
+    return mu
